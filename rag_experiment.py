@@ -1,4 +1,5 @@
 import os
+import torch
 from pathlib import Path
 import pickle
 import platform
@@ -50,6 +51,62 @@ def timeout(seconds: int) -> Generator:
         finally:
             timer.cancel()
 
+def get_gpu_config():
+    """Determine GPU configuration based on available hardware."""
+    # Add CUDA verification logging
+    print("\nGPU Detection:")
+    print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"CUDA version: {torch.version.cuda}")
+    
+    if torch.cuda.is_available():
+        # Force CUDA initialization
+        torch.cuda.init()
+        current_device = torch.cuda.current_device()
+        gpu_memory = torch.cuda.get_device_properties(current_device).total_memory / (1024**3)
+        print(f"GPU detected: {torch.cuda.get_device_name(current_device)}")
+        print(f"Available GPU memory: {gpu_memory:.2f} GB")
+        print(f"Using CUDA device: {current_device}")
+        
+        # Specific configuration for RTX 4060
+        if "4060" in torch.cuda.get_device_name(current_device).lower():
+            return {
+                "n_gpu_layers": 20,     # Conservative setting for 6GB VRAM
+                "main_gpu": current_device,
+                "tensor_split": None,
+                "n_batch": 128,         # Reduced batch size
+                "f16_kv": True,         # Enable half-precision key/value cache
+                "use_mmap": False,      # Disable memory mapping
+                "use_mlock": True       # Lock memory in RAM
+            }
+        # Configure based on available GPU memory
+        if gpu_memory >= 24:  # High-end GPUs
+            return {
+                "n_gpu_layers": -1,  # Use all layers on GPU
+                "main_gpu": 0,
+                "tensor_split": None,
+                "n_batch": 512
+            }
+        elif gpu_memory >= 6:  # Mid-range GPUs like RTX 4060 6GB
+            return {
+                "n_gpu_layers": 24,  # Reduced from 32 to better fit 6GB VRAM
+                "main_gpu": 0,
+                "tensor_split": None,
+                "n_batch": 192  # Reduced from 256 for better memory management
+            }
+        else:  # Low-memory GPUs
+            return {
+                "n_gpu_layers": 16,
+                "main_gpu": 0,
+                "tensor_split": None,
+                "n_batch": 128
+            }
+    return {
+        "n_gpu_layers": 0,  # CPU only
+        "main_gpu": -1,
+        "tensor_split": None,
+        "n_batch": 64
+    }
+
 @dataclass
 class Config:
     """Configuration settings for the RAG system.
@@ -87,6 +144,10 @@ class Config:
     response_timeout: int = 300  # Maximum time to wait for response in seconds
     n_gpu_layers: int = 1  # Number of layers to offload to GPU
     context_window: int = 10000  # Context window size
+    gpu_config: dict = None
+    
+    def __post_init__(self):
+        self.gpu_config = get_gpu_config()
 
 def get_or_create_embeddings(persist_directory: str = "embeddings_cache", model_name: str = "meta-llama/Llama-3.2-3B"):
     """Create or load cached embeddings."""
@@ -186,27 +247,42 @@ class RAGSystem:
         print("   - Vector store creation complete")
 
     def _setup_llm(self) -> None:
-        """Initialize the LLM with proper error handling."""
+        """Initialize the LLM with GPU support when available."""
         try:
+            print("\nLLM GPU Setup:")
+            print(f"CUDA Device Count: {torch.cuda.device_count()}")
+            if torch.cuda.is_available():
+                print(f"Current CUDA Device: {torch.cuda.get_device_name(torch.cuda.current_device())}")
+            
             print("   - Checking LLM model file...")
             if not os.path.exists(self.config.llm_model_path):
                 raise FileNotFoundError(f"LLama model file not found at: {self.config.llm_model_path}")
             
-            print("   - Initializing LLM...")
+            print("   - Initializing LLM with GPU configuration...")
             self.llm = LlamaCpp(
                 model_path=self.config.llm_model_path,
                 temperature=self.config.temperature,
                 max_tokens=self.config.max_tokens,
                 top_p=self.config.top_p,
                 n_ctx=self.config.context_window,
-                n_gpu_layers=self.config.n_gpu_layers,
+                n_gpu_layers=self.config.gpu_config["n_gpu_layers"],
+                main_gpu=self.config.gpu_config["main_gpu"],
+                tensor_split=self.config.gpu_config["tensor_split"],
+                n_batch=self.config.gpu_config["n_batch"],
+                f16_kv=self.config.gpu_config.get("f16_kv", True),
+                use_mmap=self.config.gpu_config.get("use_mmap", False),
+                use_mlock=self.config.gpu_config.get("use_mlock", True),
                 verbose=True,
                 n_threads=os.cpu_count(),  # Use all available CPU threads
                 stream=False  # Disable streaming for better control
             )
-            print("   - LLM initialization successful")
+            print(f"   - LLM initialization successful with following GPU config:")
+            print(f"     - GPU Layers: {self.config.gpu_config['n_gpu_layers']}")
+            print(f"     - Batch Size: {self.config.gpu_config['n_batch']}")
+            print(f"     - Main GPU: {self.config.gpu_config['main_gpu']}")
         except Exception as e:
             print("   - ERROR: LLM initialization failed!")
+            print(f"   - Error details: {str(e)}")
             raise RuntimeError(f"Failed to initialize LLama model: {str(e)}")
 
     def query(self, query_text: str) -> str:
