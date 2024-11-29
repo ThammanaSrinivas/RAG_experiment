@@ -6,4 +6,4 @@ pypdf
 llama-cpp-python
 transformers
 tqdm
-re
+python-dotenv>=0.19.0

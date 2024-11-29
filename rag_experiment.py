@@ -1,12 +1,14 @@
+import os
 from pathlib import Path
 import pickle
-import os
+import platform
+import threading
+import signal
 import time
 from typing import Any, Optional, Generator
 from dataclasses import dataclass
-import signal
 from contextlib import contextmanager
-import re  # Add this at the top with other imports
+import re
 from dotenv import load_dotenv
 
 from langchain_community.document_loaders import PyPDFDirectoryLoader
@@ -24,19 +26,29 @@ class TimeoutException(Exception):
 
 @contextmanager
 def timeout(seconds: int) -> Generator:
-    """Context manager for adding timeout to operations."""
-    def timeout_handler(signum, frame):
+    """Cross-platform timeout context manager."""
+    def timeout_handler():
         raise TimeoutException("Operation timed out")
 
-    # Set up timeout signal
-    signal.signal(signal.SIGALRM, timeout_handler)
-    signal.alarm(seconds)
-    
-    try:
-        yield
-    finally:
-        # Disable the alarm
-        signal.alarm(0)
+    if platform.system() != 'Windows':
+        # Unix-like systems can use SIGALRM
+        def alarm_handler(signum, frame):
+            raise TimeoutException("Operation timed out")
+        
+        signal.signal(signal.SIGALRM, alarm_handler)
+        signal.alarm(seconds)
+        try:
+            yield
+        finally:
+            signal.alarm(0)
+    else:
+        # Windows systems use threading
+        timer = threading.Timer(seconds, timeout_handler)
+        timer.start()
+        try:
+            yield
+        finally:
+            timer.cancel()
 
 @dataclass
 class Config:
@@ -63,10 +75,10 @@ class Config:
         n_gpu_layers: Number of layers to offload to GPU
         context_window: Context window size
     """
-    pdf_dir: Path = Path(os.getenv('PDF_DIRECTORY', 'data/tech'))
+    pdf_dir: Path = Path(os.getenv('PDF_DIRECTORY', os.path.join('data', 'tech')))
     persist_directory: str = "embeddings_cache"
     embeddings_model_name: str = "all-MiniLM-L12-v2"
-    llm_model_path: str = os.getenv('LLM_MODEL_PATH', 'models/Llama-3.2-3B-Instruct-Q4_K_M.gguf')
+    llm_model_path: str = os.getenv('LLM_MODEL_PATH', os.path.join('models', 'Llama-3.2-3B-Instruct-Q4_K_M.gguf'))
     chunk_size: int = 900 # 15 minutes
     chunk_overlap: int = 50
     temperature: float = 0.2
@@ -304,8 +316,8 @@ def main():
     print("Setting up environment...")
     
     # Load environment variables from .env file
-    env_path = Path(__file__).parent / '.env'
-    if not env_path.exists():
+    env_path = os.path.join(os.path.dirname(__file__), '.env')
+    if not os.path.exists(env_path):
         raise FileNotFoundError(
             "'.env' file not found. Please create one with required environment variables"
         )
