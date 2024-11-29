@@ -1,0 +1,9 @@
+langchain
+langchain-community
+sentence-transformers
+chromadb
+pypdf
+llama-cpp-python
+transformers
+tqdm
+re
