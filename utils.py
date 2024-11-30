@@ -8,6 +8,7 @@ import os
 import pickle
 from pathlib import Path
 from sentence_transformers import SentenceTransformer
+from langchain.embeddings.base import Embeddings
 
 class TimeoutException(Exception):
     pass
@@ -33,6 +34,18 @@ def timeout(seconds: int) -> Generator:
         finally:
             timer.cancel()
 
+class SentenceTransformerEmbeddings(Embeddings):
+    def __init__(self, model_name: str):
+        self.model = SentenceTransformer(model_name)
+
+    def embed_documents(self, texts: list[str]) -> list[list[float]]:
+        embeddings = self.model.encode(texts)
+        return embeddings.tolist()
+
+    def embed_query(self, text: str) -> list[float]:
+        embedding = self.model.encode(text)
+        return embedding.tolist()
+
 def get_or_create_embeddings(persist_directory: str, model_name: str):
     """Create or load cached embeddings."""
     cache_file = Path(persist_directory) / f"{model_name.replace('/', '_').replace('-', '_')}_embeddings.pkl"
@@ -42,7 +55,7 @@ def get_or_create_embeddings(persist_directory: str, model_name: str):
         with open(cache_file, 'rb') as f:
             return pickle.load(f)
     
-    embeddings = SentenceTransformer(model_name)
+    embeddings = SentenceTransformerEmbeddings(model_name)
     with open(cache_file, 'wb') as f:
         pickle.dump(embeddings, f)
     

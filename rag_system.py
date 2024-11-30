@@ -1,5 +1,6 @@
 import logging
 import torch
+import gc
 from pathlib import Path
 from langchain_community.document_loaders import PyPDFDirectoryLoader
 from langchain_community.vectorstores import Chroma
@@ -71,14 +72,25 @@ class RAGSystem:
         }
 
         if torch.cuda.is_available():
-            logger.info("GPU detected - configuring for GPU inference")
-            torch.cuda.empty_cache()
-            gpu_params = {
-                **self.config.gpu_config,  # This already includes n_ctx
-                "f16_kv": True,
-                "mmap": True
-            }
-            logger.info(f"GPU Configuration: {gpu_params}")
+            try:
+                logger.info("GPU detected - configuring for GPU inference")
+                # Clear CUDA cache
+                torch.cuda.empty_cache()
+                gc.collect()
+                
+                gpu_params = {
+                    **self.config.gpu_config,  # This already includes n_ctx
+                    "f16_kv": True,
+                    "mmap": True
+                }
+                logger.info(f"GPU Configuration: {gpu_params}")
+            except Exception as e:
+                logger.warning(f"GPU initialization failed, falling back to CPU: {e}")
+                gpu_params = {
+                    "n_gpu_layers": 0,
+                    "n_batch": 64,
+                    "n_ctx": self.config.context_window
+                }
 
         self.llm = LlamaCpp(
             model_path=str(model_path),
@@ -90,39 +102,55 @@ class RAGSystem:
         )
 
     def query(self, query_text: str) -> str:
+        # Clear GPU memory before query
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+            gc.collect()
+            
         with timeout(self.config.response_timeout):
-            retriever = self.vectorstore.as_retriever(
-                search_type="mmr",
-                search_kwargs={'k': 1, 'fetch_k': 5}  # reduced number of retrieved documents
-            )
+            try:
+                retriever = self.vectorstore.as_retriever(
+                    search_type="mmr",
+                    search_kwargs={'k': 1, 'fetch_k': 5}  # reduced number of retrieved documents
+                )
 
-            # Get retrieval context
-            retrieved_docs = retriever.get_relevant_documents(query_text)
-            context = "\n".join(doc.page_content for doc in retrieved_docs)
-            
-            # Truncate context if too long (rough estimation)
-            max_context_chars = self.config.max_input_tokens * 4  # rough char to token ratio
-            if len(context) > max_context_chars:
-                context = context[:max_context_chars] + "..."
+                # Get retrieval context
+                retrieved_docs = retriever.get_relevant_documents(query_text)
+                context = "\n".join(doc.page_content for doc in retrieved_docs)
+                
+                # Truncate context if too long (rough estimation)
+                max_context_chars = self.config.max_input_tokens * 4  # rough char to token ratio
+                if len(context) > max_context_chars:
+                    context = context[:max_context_chars] + "..."
 
-            prompt = ChatPromptTemplate.from_messages([
-                ("system", "Answer based on the following context.\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:")
-            ])
+                prompt = ChatPromptTemplate.from_messages([
+                    ("system", "Answer based on the following context.\n\nContext:\n{context}\n\nQuestion: {query}\n\nAnswer:")
+                ])
 
-            chat_history = self.chat_history.get_context()
-            # Limit chat history length
-            if chat_history:
-                chat_history = chat_history[-1000:]  # keep only last 1000 chars
+                chat_history = self.chat_history.get_context()
+                # Limit chat history length
+                if chat_history:
+                    chat_history = chat_history[-1000:]  # keep only last 1000 chars
 
-            rag_chain = (
-                {"context": lambda _: context, 
-                 "query": RunnablePassthrough(),
-                 "chat_history": lambda _: chat_history}
-                | prompt
-                | self.llm
-                | StrOutputParser()
-            )
-            
-            response = rag_chain.invoke(query_text)
-            self.chat_history.add(query_text, response)
-            return response
+                rag_chain = (
+                    {"context": lambda _: context, 
+                     "query": RunnablePassthrough(),
+                     "chat_history": lambda _: chat_history}
+                    | prompt
+                    | self.llm
+                    | StrOutputParser()
+                )
+                
+                response = rag_chain.invoke(query_text)
+                self.chat_history.add(query_text, response)
+                return response
+            except RuntimeError as e:
+                if "CUDA" in str(e):
+                    logger.error(f"CUDA error occurred: {e}")
+                    # Clear memory and try again with smaller batch
+                    torch.cuda.empty_cache()
+                    gc.collect()
+                    self.config.gpu_config["n_batch"] //= 2
+                    self._setup_llm()
+                    return self.query(query_text)
+                raise e
